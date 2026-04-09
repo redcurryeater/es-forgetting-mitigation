@@ -136,6 +136,26 @@ def parse_args():
             "measurement (initial sanity check still runs if cache exists)."
         ),
     )
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help=(
+            "Save engine 0's center weights every N generations to "
+            "{experiment_dir}/.../model_saves/checkpoint_iter_{i}/pytorch_model.pth. "
+            "0 disables periodic checkpointing (final-only save still happens)."
+        ),
+    )
+    parser.add_argument(
+        "--keep_last_n_checkpoints",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, keep only the last N periodic checkpoints on disk and "
+            "delete older ones after each new save. The final checkpoint "
+            "(written after all iterations finish) is never pruned."
+        ),
+    )
     args = parser.parse_args()
     # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
@@ -777,6 +797,47 @@ def main(args):
                 f"KL eval (held-out, center weights) = {kl_eval:.4f}  "
                 f"[measured in {time.time() - eval_start:.2f}s]"
             )
+
+        # Periodic checkpoint save: dumps engine 0's center weights as a raw
+        # state_dict to {model_saves_dir}/checkpoint_iter_{i}/pytorch_model.pth.
+        # Skip i==num_iterations-1 because the post-loop final-save block already
+        # handles it (and uses a different naming convention).
+        if (
+            args.checkpoint_every > 0
+            and i % args.checkpoint_every == 0
+            and i != args.num_iterations - 1
+        ):
+            ckpt_start = time.time()
+            ckpt_dir = f"{model_saves_dir}/checkpoint_iter_{i}"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ray.get(
+                engines[0].collective_rpc.remote(
+                    "save_self_weights_to_disk", args=(f"{ckpt_dir}/pytorch_model.pth",)
+                )
+            )
+            print(
+                f"[checkpoint] Saved iter {i} to {ckpt_dir} "
+                f"[in {time.time() - ckpt_start:.2f}s]"
+            )
+
+            # Prune old checkpoints if --keep_last_n_checkpoints is set.
+            if args.keep_last_n_checkpoints > 0:
+                existing = sorted(
+                    (
+                        d for d in os.listdir(model_saves_dir)
+                        if d.startswith("checkpoint_iter_")
+                    ),
+                    key=lambda d: int(d.split("_")[-1]),
+                )
+                to_delete = existing[: -args.keep_last_n_checkpoints]
+                for d in to_delete:
+                    victim = os.path.join(model_saves_dir, d)
+                    try:
+                        shutil.rmtree(victim)
+                        if args.verbose:
+                            print(f"[checkpoint] Pruned old checkpoint {victim}")
+                    except OSError as e:
+                        print(f"[checkpoint] Failed to prune {victim}: {e}")
 
         # Logging per-result and timing
         if args.verbose:
