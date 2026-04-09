@@ -29,6 +29,13 @@ NUM_ENGINES = 4
 NUM_ITERATIONS = 1000
 EXPERIMENT_DIR = "es-ft-experiment"
 
+# KL behavioral-anchor defaults
+KL_BETA = 0.0  # off by default; set > 0 to enable
+ANCHOR_DATASETS = "mmlu,race,hellaswag"
+NUM_ANCHOR_PROMPTS = 32  # total across all anchor datasets
+ANCHOR_MAX_TOKENS = 64
+ANCHOR_SEED = 1234
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="ES Fine-tuning for Countdown Task with multi-engine NCCL sync"
@@ -46,6 +53,37 @@ def parse_args():
         "--global_seed",
         type=int,
         help="Global random seed",
+    )
+    # KL behavioral anchor (general-capability drift mitigation)
+    parser.add_argument(
+        "--kl_beta",
+        type=float,
+        default=KL_BETA,
+        help="KL penalty coefficient for general-capability anchor. 0 disables the anchor.",
+    )
+    parser.add_argument(
+        "--anchor_datasets",
+        type=str,
+        default=ANCHOR_DATASETS,
+        help="Comma-separated subset of {mmlu,race,hellaswag} to source anchor prompts from.",
+    )
+    parser.add_argument(
+        "--num_anchor_prompts",
+        type=int,
+        default=NUM_ANCHOR_PROMPTS,
+        help="Total number of anchor prompts (split evenly across --anchor_datasets).",
+    )
+    parser.add_argument(
+        "--anchor_max_tokens",
+        type=int,
+        default=ANCHOR_MAX_TOKENS,
+        help="Max tokens to sample from the base model for each anchor reference completion.",
+    )
+    parser.add_argument(
+        "--anchor_seed",
+        type=int,
+        default=ANCHOR_SEED,
+        help="Seed used to sample anchor prompts from the source datasets.",
     )
     args = parser.parse_args()
     # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
@@ -104,6 +142,188 @@ def evaluate_countdown_handle(llm, task_datas):
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
+
+# ----------------------------- KL behavioral anchor -----------------------------
+#
+# We anchor the perturbed policy to the *unperturbed base model* on prompts drawn
+# from general-capability benchmarks (MMLU/RACE/HellaSwag). The reference behavior
+# is fixed at startup: we sample one greedy completion from the base model for
+# each anchor prompt and cache its per-token log-probabilities.
+#
+# Per ES candidate we then compute log pi_perturbed(ref_completion | prompt)
+# via vLLM's `prompt_logprobs=1`, and form the (token-averaged) plug-in estimate
+#     KL_hat_i = mean_t [ log pi_ref(y_t | y_<t, x) - log pi_perturbed(y_t | y_<t, x) ]
+# i.e. the standard 1-sample estimator of KL(pi_ref || pi_perturbed) for samples
+# drawn from pi_ref. The augmented per-candidate reward is:
+#     R_tilde_i = R_task_i - kl_beta * KL_hat_i
+# Note: under ES with per-generation reward normalization, candidate-independent
+# constants in the penalty cancel, so the cached pi_ref logprobs only matter for
+# *logging* a meaningful KL number -- the ES update direction is identical if we
+# instead used negative log-likelihood of the ref completion as the penalty.
+
+def load_anchor_prompts(dataset_spec, num_total, seed):
+    """Sample raw text prompts from MMLU/RACE/HellaSwag.
+
+    Returns a list of strings. Splits `num_total` evenly across the requested
+    datasets (any remainder goes to the first listed dataset).
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            "KL anchor requires the `datasets` library. `pip install datasets`."
+        ) from e
+
+    names = [n.strip().lower() for n in dataset_spec.split(",") if n.strip()]
+    if not names:
+        return []
+    per = num_total // len(names)
+    remainder = num_total - per * len(names)
+    rng = random.Random(seed)
+    prompts = []
+
+    for idx, name in enumerate(names):
+        n = per + (remainder if idx == 0 else 0)
+        if n <= 0:
+            continue
+        if name == "mmlu":
+            ds = load_dataset("cais/mmlu", "all", split="test")
+            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            for i in picks:
+                ex = ds[i]
+                opts = "\n".join(
+                    f"{chr(65 + j)}. {ch}" for j, ch in enumerate(ex["choices"])
+                )
+                prompts.append(
+                    f"Question: {ex['question']}\n{opts}\nAnswer:"
+                )
+        elif name == "race":
+            ds = load_dataset("ehovy/race", "all", split="test")
+            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            for i in picks:
+                ex = ds[i]
+                opts = "\n".join(
+                    f"{chr(65 + j)}. {ch}" for j, ch in enumerate(ex["options"])
+                )
+                prompts.append(
+                    f"Article: {ex['article']}\n\nQuestion: {ex['question']}\n{opts}\nAnswer:"
+                )
+        elif name == "hellaswag":
+            ds = load_dataset("Rowan/hellaswag", split="validation")
+            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            for i in picks:
+                ex = ds[i]
+                ctx = ex.get("ctx") or ex.get("ctx_a", "")
+                prompts.append(f"Complete the following passage:\n{ctx}")
+        else:
+            raise ValueError(f"Unknown anchor dataset: {name}")
+
+    return prompts
+
+
+def build_anchor_cache(reference_engine, anchor_prompts, max_completion_tokens):
+    """Generate ref completions on the unperturbed base engine and cache
+    per-token logprobs of pi_ref over those completions.
+
+    Each cache entry stores token IDs (not text) so the per-candidate scoring
+    pass can bypass tokenization and reuse the exact same token sequence.
+    """
+    if not anchor_prompts:
+        return []
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        max_tokens=max_completion_tokens,
+        logprobs=1,  # return logprob of each generated token
+    )
+    outputs = ray.get(
+        reference_engine.generate.remote(anchor_prompts, sampling_params, use_tqdm=False)
+    )
+
+    cache = []
+    for prompt_text, out in zip(anchor_prompts, outputs):
+        prompt_token_ids = list(out.prompt_token_ids)
+        gen = out.outputs[0]
+        completion_token_ids = list(gen.token_ids)
+        if not completion_token_ids:
+            continue
+
+        ref_logprobs = []
+        for tok_id, lp_dict in zip(completion_token_ids, gen.logprobs or []):
+            if lp_dict is None or tok_id not in lp_dict:
+                continue
+            ref_logprobs.append(float(lp_dict[tok_id].logprob))
+
+        if not ref_logprobs:
+            continue
+
+        cache.append(
+            {
+                "prompt_text": prompt_text,
+                "full_token_ids": prompt_token_ids + completion_token_ids,
+                "num_prompt_tokens": len(prompt_token_ids),
+                "num_completion_tokens": len(ref_logprobs),
+                "ref_logprobs": ref_logprobs,  # length == num_completion_tokens
+            }
+        )
+
+    return cache
+
+
+def evaluate_anchor_handle(llm, anchor_cache):
+    """Dispatch a (non-blocking) prompt-logprob pass for the anchor sequences.
+
+    Uses `prompt_token_ids` to bypass re-tokenization and guarantee the same
+    token boundaries as the cached reference run.
+    """
+    if not anchor_cache:
+        return None
+    prompts = [{"prompt_token_ids": item["full_token_ids"]} for item in anchor_cache]
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        max_tokens=1,
+        prompt_logprobs=1,
+    )
+    return llm.generate.remote(prompts, sampling_params, use_tqdm=False)
+
+
+def _postprocess_anchor_outputs(outputs, anchor_cache):
+    """Compute mean per-token KL(pi_ref || pi_perturbed) across anchor samples.
+
+    Per sample, KL is approximated by the mean over completion tokens of
+    `log pi_ref(t) - log pi_perturbed(t)`. Per-prompt KLs are then averaged
+    uniformly to produce the candidate's scalar penalty.
+    """
+    per_prompt_kls = []
+    for out, item in zip(outputs, anchor_cache):
+        prompt_logprobs = out.prompt_logprobs or []
+        n_prompt = item["num_prompt_tokens"]
+        n_completion = item["num_completion_tokens"]
+        full_token_ids = item["full_token_ids"]
+        ref_logprobs = item["ref_logprobs"]
+
+        diffs = []
+        for offset in range(n_completion):
+            pos = n_prompt + offset
+            if pos >= len(prompt_logprobs):
+                break
+            lp_dict = prompt_logprobs[pos]
+            if lp_dict is None:
+                continue
+            tok_id = full_token_ids[pos]
+            lp_obj = lp_dict.get(tok_id)
+            if lp_obj is None:
+                continue
+            diffs.append(ref_logprobs[offset] - float(lp_obj.logprob))
+
+        if diffs:
+            per_prompt_kls.append(float(np.mean(diffs)))
+
+    if not per_prompt_kls:
+        return 0.0
+    return float(np.mean(per_prompt_kls))
 
 def _postprocess_outputs(outputs, task_datas):
     rewards = []
@@ -188,6 +408,30 @@ def main(args):
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
+    # Build the KL behavioral-anchor cache while all engines are still at the
+    # base-model weights. We do this on engine 0 only and reuse the cached
+    # token IDs / pi_ref logprobs across every candidate evaluation thereafter.
+    anchor_cache = []
+    if args.kl_beta > 0.0 and args.num_anchor_prompts > 0:
+        print(
+            f"[anchor] Sampling {args.num_anchor_prompts} prompts from "
+            f"{args.anchor_datasets} for KL anchoring (beta={args.kl_beta})..."
+        )
+        anchor_prompts = load_anchor_prompts(
+            args.anchor_datasets, args.num_anchor_prompts, args.anchor_seed
+        )
+        print(f"[anchor] Loaded {len(anchor_prompts)} anchor prompts; sampling base-model refs...")
+        anchor_cache = build_anchor_cache(
+            engines[0], anchor_prompts, args.anchor_max_tokens
+        )
+        total_ref_tokens = sum(c["num_completion_tokens"] for c in anchor_cache)
+        print(
+            f"[anchor] Cached {len(anchor_cache)} anchor sequences "
+            f"({total_ref_tokens} ref completion tokens total)."
+        )
+    else:
+        print("[anchor] KL anchor disabled (kl_beta=0 or num_anchor_prompts=0).")
+
     # Engines start with identical weights (loaded from the same HF checkpoint)
     # For each iteration:
     # - Explore: per-seed add noise -> eval -> subtract noise (GPU-only)
@@ -215,11 +459,13 @@ def main(args):
             # Add exploration noise
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
             handle, start_ts = evaluate_countdown_handle(llm, task_datas)
+            anchor_handle = evaluate_anchor_handle(llm, anchor_cache)
             inflight[handle] = {
                 "engine": llm,
                 "engine_idx": eng_idx,
                 "seed": seed,
                 "start_ts": start_ts,
+                "anchor_handle": anchor_handle,
             }
 
         while inflight:
@@ -229,11 +475,27 @@ def main(args):
 
             outputs = ray.get(h)
             metrics = _postprocess_outputs(outputs, task_datas)
+
+            # KL behavioral anchor: ray.get the prompt-logprob handle (likely
+            # already complete since it was dispatched alongside the task call).
+            kl_estimate = 0.0
+            if meta["anchor_handle"] is not None:
+                anchor_outputs = ray.get(meta["anchor_handle"])
+                kl_estimate = _postprocess_anchor_outputs(anchor_outputs, anchor_cache)
+            metrics["kl"] = kl_estimate
+            metrics["augmented_reward"] = metrics["avg_reward"] - args.kl_beta * kl_estimate
+
             elapsed = time.time() - meta["start_ts"]
 
             seeds_perf[meta["seed"]] = metrics
             results_this_gen.append(
-                {"seed": meta["seed"], "avg_reward": metrics["avg_reward"], "time": elapsed}
+                {
+                    "seed": meta["seed"],
+                    "avg_reward": metrics["avg_reward"],
+                    "kl": kl_estimate,
+                    "augmented_reward": metrics["augmented_reward"],
+                    "time": elapsed,
+                }
             )
 
             llm = meta["engine"]
@@ -248,25 +510,51 @@ def main(args):
 
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(next_seed, args.sigma, False)))
             handle, start_ts = evaluate_countdown_handle(llm, task_datas)
+            anchor_handle = evaluate_anchor_handle(llm, anchor_cache)
             inflight[handle] = {
                 "engine": llm,
                 "engine_idx": meta["engine_idx"],
                 "seed": next_seed,
                 "start_ts": start_ts,
+                "anchor_handle": anchor_handle,
             }
             if args.verbose:
                 print(f"Scheduled seed {next_seed} on engine {meta['engine_idx']}")
 
-        # Normalize rewards
+        # Raw task-reward stats (still logged so we can see what the task signal
+        # looks like independent of the anchor penalty).
         all_avg_rewards = [v["avg_reward"] for v in seeds_perf.values()]
         mean_reward = float(np.mean(all_avg_rewards)) if all_avg_rewards else 0.0
         std_reward = float(np.std(all_avg_rewards)) if all_avg_rewards else 0.0
         min_reward = float(np.min(all_avg_rewards)) if all_avg_rewards else 0.0
         max_reward = float(np.max(all_avg_rewards)) if all_avg_rewards else 0.0
 
-        print(f"Mean reward: {mean_reward}, std: {std_reward}, min: {min_reward}, max: {max_reward}")
+        # KL penalty stats
+        all_kls = [v.get("kl", 0.0) for v in seeds_perf.values()]
+        mean_kl = float(np.mean(all_kls)) if all_kls else 0.0
+        max_kl = float(np.max(all_kls)) if all_kls else 0.0
+        min_kl = float(np.min(all_kls)) if all_kls else 0.0
+
+        # Augmented reward = R_task - beta * KL_hat, used to drive the ES update.
+        all_aug_rewards = [v["augmented_reward"] for v in seeds_perf.values()]
+        mean_aug = float(np.mean(all_aug_rewards)) if all_aug_rewards else 0.0
+        std_aug = float(np.std(all_aug_rewards)) if all_aug_rewards else 0.0
+
+        print(
+            f"Task reward  mean={mean_reward:.4f}  std={std_reward:.4f}  "
+            f"min={min_reward:.4f}  max={max_reward:.4f}"
+        )
+        if anchor_cache:
+            print(
+                f"KL anchor    mean={mean_kl:.4f}  min={min_kl:.4f}  max={max_kl:.4f}  "
+                f"(beta={args.kl_beta})"
+            )
+            print(f"Augmented reward (task - beta*KL)  mean={mean_aug:.4f}  std={std_aug:.4f}")
+
         for k in seeds_perf:
-            seeds_perf[k]["norm_reward"] = (seeds_perf[k]["avg_reward"] - mean_reward) / (std_reward + 1e-8)
+            seeds_perf[k]["norm_reward"] = (
+                seeds_perf[k]["augmented_reward"] - mean_aug
+            ) / (std_aug + 1e-8)
             if args.verbose:
                 print(f"Seed {k} normalized reward: {seeds_perf[k]['norm_reward']}")
 
@@ -274,6 +562,12 @@ def main(args):
         writer.add_scalar("reward/std", std_reward, i)
         writer.add_scalar("reward/min", min_reward, i)
         writer.add_scalar("reward/max", max_reward, i)
+        if anchor_cache:
+            writer.add_scalar("kl/mean", mean_kl, i)
+            writer.add_scalar("kl/min", min_kl, i)
+            writer.add_scalar("kl/max", max_kl, i)
+            writer.add_scalar("reward/augmented_mean", mean_aug, i)
+            writer.add_scalar("reward/augmented_std", std_aug, i)
 
         # Compute ES update ONLY on engine 0 (baseline is already current weights)
         per_seed_coeffs = [
