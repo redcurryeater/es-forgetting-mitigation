@@ -30,9 +30,9 @@ NUM_ITERATIONS = 1000
 EXPERIMENT_DIR = "es-ft-experiment"
 
 # KL behavioral-anchor defaults
-KL_BETA = 0.0  # off by default; set > 0 to enable
+KL_BETA = 0.0  # 0 = measurement only (or off entirely if NUM_ANCHOR_PROMPTS=0)
 ANCHOR_DATASETS = "mmlu,race,hellaswag"
-NUM_ANCHOR_PROMPTS = 32  # total across all anchor datasets
+NUM_ANCHOR_PROMPTS = 0  # 0 = no anchor at all; >0 builds cache and logs KL/iteration
 ANCHOR_MAX_TOKENS = 64
 ANCHOR_SEED = 1234
 
@@ -59,7 +59,11 @@ def parse_args():
         "--kl_beta",
         type=float,
         default=KL_BETA,
-        help="KL penalty coefficient for general-capability anchor. 0 disables the anchor.",
+        help=(
+            "KL penalty coefficient for the general-capability anchor. "
+            "0 = measurement-only (still logs kl/* if num_anchor_prompts > 0); "
+            ">0 = subtract beta * KL_hat from per-candidate reward."
+        ),
     )
     parser.add_argument(
         "--anchor_datasets",
@@ -84,6 +88,35 @@ def parse_args():
         type=int,
         default=ANCHOR_SEED,
         help="Seed used to sample anchor prompts from the source datasets.",
+    )
+    parser.add_argument(
+        "--eval_anchor_seed",
+        type=int,
+        default=None,
+        help=(
+            "If set, build a held-out eval anchor (disjoint from --anchor_seed "
+            "at the dataset row-index level), measured per-iteration but never "
+            "used as a penalty. Required for any clean 'anchor generalizes' claim."
+        ),
+    )
+    parser.add_argument(
+        "--num_eval_anchor_prompts",
+        type=int,
+        default=None,
+        help=(
+            "Number of held-out eval anchor prompts. If unset, mirrors "
+            "--num_anchor_prompts. Only used when --eval_anchor_seed is set."
+        ),
+    )
+    parser.add_argument(
+        "--eval_anchor_every",
+        type=int,
+        default=10,
+        help=(
+            "Measure held-out eval KL on the (unperturbed) center weights "
+            "every N generations. Single scalar per event. 0 disables periodic "
+            "measurement (initial sanity check still runs if cache exists)."
+        ),
     )
     args = parser.parse_args()
     # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
@@ -161,11 +194,19 @@ def evaluate_countdown_handle(llm, task_datas):
 # *logging* a meaningful KL number -- the ES update direction is identical if we
 # instead used negative log-likelihood of the ref completion as the penalty.
 
-def load_anchor_prompts(dataset_spec, num_total, seed):
+def load_anchor_prompts(dataset_spec, num_total, seed, exclude=None):
     """Sample raw text prompts from MMLU/RACE/HellaSwag.
 
-    Returns a list of strings. Splits `num_total` evenly across the requested
-    datasets (any remainder goes to the first listed dataset).
+    Splits `num_total` evenly across the requested datasets (any remainder
+    goes to the first listed dataset).
+
+    `exclude`: optional dict mapping dataset name -> set of dataset row indices
+    that must NOT be sampled. Used to guarantee the held-out eval anchor is
+    disjoint from the training anchor at the row-index level.
+
+    Returns a tuple `(prompts, used_indices)` where `used_indices` is a dict
+    mirroring the structure of `exclude` (dataset name -> set of indices),
+    suitable for chaining into a follow-up call.
     """
     try:
         from datasets import load_dataset
@@ -176,11 +217,20 @@ def load_anchor_prompts(dataset_spec, num_total, seed):
 
     names = [n.strip().lower() for n in dataset_spec.split(",") if n.strip()]
     if not names:
-        return []
+        return [], {}
     per = num_total // len(names)
     remainder = num_total - per * len(names)
     rng = random.Random(seed)
     prompts = []
+    used_indices = {}
+    exclude = exclude or {}
+
+    def _pick(dataset_obj, name, n_wanted):
+        skip = exclude.get(name, set())
+        candidates = [i for i in range(len(dataset_obj)) if i not in skip]
+        if not candidates:
+            return []
+        return rng.sample(candidates, min(n_wanted, len(candidates)))
 
     for idx, name in enumerate(names):
         n = per + (remainder if idx == 0 else 0)
@@ -188,7 +238,8 @@ def load_anchor_prompts(dataset_spec, num_total, seed):
             continue
         if name == "mmlu":
             ds = load_dataset("cais/mmlu", "all", split="test")
-            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            picks = _pick(ds, name, n)
+            used_indices[name] = set(picks)
             for i in picks:
                 ex = ds[i]
                 opts = "\n".join(
@@ -199,7 +250,8 @@ def load_anchor_prompts(dataset_spec, num_total, seed):
                 )
         elif name == "race":
             ds = load_dataset("ehovy/race", "all", split="test")
-            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            picks = _pick(ds, name, n)
+            used_indices[name] = set(picks)
             for i in picks:
                 ex = ds[i]
                 opts = "\n".join(
@@ -210,7 +262,8 @@ def load_anchor_prompts(dataset_spec, num_total, seed):
                 )
         elif name == "hellaswag":
             ds = load_dataset("Rowan/hellaswag", split="validation")
-            picks = rng.sample(range(len(ds)), min(n, len(ds)))
+            picks = _pick(ds, name, n)
+            used_indices[name] = set(picks)
             for i in picks:
                 ex = ds[i]
                 ctx = ex.get("ctx") or ex.get("ctx_a", "")
@@ -218,7 +271,7 @@ def load_anchor_prompts(dataset_spec, num_total, seed):
         else:
             raise ValueError(f"Unknown anchor dataset: {name}")
 
-    return prompts
+    return prompts, used_indices
 
 
 def build_anchor_cache(reference_engine, anchor_prompts, max_completion_tokens):
@@ -411,26 +464,89 @@ def main(args):
     # Build the KL behavioral-anchor cache while all engines are still at the
     # base-model weights. We do this on engine 0 only and reuse the cached
     # token IDs / pi_ref logprobs across every candidate evaluation thereafter.
+    #
+    # Build is gated only on `num_anchor_prompts > 0` (NOT kl_beta), so we can
+    # run a measurement-only baseline (kl_beta=0) that still logs kl/* curves
+    # for apples-to-apples comparison against an anchored run (kl_beta>0).
+    #
+    # Optionally also build a held-out *eval* anchor (disjoint row indices,
+    # different sampling seed) that is measured per iteration but never used
+    # as a penalty target. This is what you compare against to claim the
+    # anchor generalizes beyond the prompts it was trained on.
     anchor_cache = []
-    if args.kl_beta > 0.0 and args.num_anchor_prompts > 0:
+    eval_anchor_cache = []
+    train_anchor_indices = {}
+
+    if args.num_anchor_prompts > 0:
+        mode = "penalty" if args.kl_beta > 0.0 else "measurement-only"
         print(
-            f"[anchor] Sampling {args.num_anchor_prompts} prompts from "
-            f"{args.anchor_datasets} for KL anchoring (beta={args.kl_beta})..."
+            f"[anchor] Sampling {args.num_anchor_prompts} train prompts from "
+            f"{args.anchor_datasets} for KL anchor ({mode}, beta={args.kl_beta})..."
         )
-        anchor_prompts = load_anchor_prompts(
+        anchor_prompts, train_anchor_indices = load_anchor_prompts(
             args.anchor_datasets, args.num_anchor_prompts, args.anchor_seed
         )
-        print(f"[anchor] Loaded {len(anchor_prompts)} anchor prompts; sampling base-model refs...")
+        print(f"[anchor] Loaded {len(anchor_prompts)} train anchor prompts; sampling base-model refs...")
         anchor_cache = build_anchor_cache(
             engines[0], anchor_prompts, args.anchor_max_tokens
         )
         total_ref_tokens = sum(c["num_completion_tokens"] for c in anchor_cache)
         print(
-            f"[anchor] Cached {len(anchor_cache)} anchor sequences "
+            f"[anchor] Cached {len(anchor_cache)} train anchor sequences "
             f"({total_ref_tokens} ref completion tokens total)."
         )
     else:
-        print("[anchor] KL anchor disabled (kl_beta=0 or num_anchor_prompts=0).")
+        print("[anchor] KL anchor disabled (num_anchor_prompts=0).")
+
+    if args.eval_anchor_seed is not None and args.num_anchor_prompts > 0:
+        n_eval = (
+            args.num_eval_anchor_prompts
+            if args.num_eval_anchor_prompts is not None
+            else args.num_anchor_prompts
+        )
+        if n_eval > 0:
+            print(
+                f"[anchor] Sampling {n_eval} held-out eval prompts from "
+                f"{args.anchor_datasets} (eval_anchor_seed={args.eval_anchor_seed}, "
+                f"disjoint from train anchor indices)..."
+            )
+            eval_prompts, _ = load_anchor_prompts(
+                args.anchor_datasets,
+                n_eval,
+                args.eval_anchor_seed,
+                exclude=train_anchor_indices,
+            )
+            print(
+                f"[anchor] Loaded {len(eval_prompts)} held-out eval anchor prompts; "
+                f"sampling base-model refs..."
+            )
+            eval_anchor_cache = build_anchor_cache(
+                engines[0], eval_prompts, args.anchor_max_tokens
+            )
+            eval_ref_tokens = sum(c["num_completion_tokens"] for c in eval_anchor_cache)
+            print(
+                f"[anchor] Cached {len(eval_anchor_cache)} held-out eval anchor sequences "
+                f"({eval_ref_tokens} ref completion tokens total). "
+                f"This anchor is measured but NEVER used as a penalty."
+            )
+    elif args.eval_anchor_seed is not None:
+        print(
+            "[anchor] --eval_anchor_seed set but --num_anchor_prompts=0; "
+            "skipping eval anchor build."
+        )
+
+    # Sanity check: held-out eval KL on the initial (un-fine-tuned) center
+    # weights should be ~0 since the cache was built from these exact weights.
+    # Logged at step -1 so the curve has a clean "before training" anchor point.
+    if eval_anchor_cache:
+        eval_handle = evaluate_anchor_handle(engines[0], eval_anchor_cache)
+        eval_outputs = ray.get(eval_handle)
+        initial_kl_eval = _postprocess_anchor_outputs(eval_outputs, eval_anchor_cache)
+        print(
+            f"[anchor] Initial held-out eval KL = {initial_kl_eval:.4f} "
+            f"(should be ~0 since cache was built against these same weights)"
+        )
+        writer.add_scalar("kl/eval", initial_kl_eval, -1)
 
     # Engines start with identical weights (loaded from the same HF checkpoint)
     # For each iteration:
@@ -529,7 +645,7 @@ def main(args):
         min_reward = float(np.min(all_avg_rewards)) if all_avg_rewards else 0.0
         max_reward = float(np.max(all_avg_rewards)) if all_avg_rewards else 0.0
 
-        # KL penalty stats
+        # KL penalty stats (training anchor — used in penalty when beta>0)
         all_kls = [v.get("kl", 0.0) for v in seeds_perf.values()]
         mean_kl = float(np.mean(all_kls)) if all_kls else 0.0
         max_kl = float(np.max(all_kls)) if all_kls else 0.0
@@ -591,6 +707,27 @@ def main(args):
         if args.verbose:
             print(f"Broadcasted updated weights in {time.time() - broadcast_start}s")
         writer.add_scalar("time/broadcast", time.time() - broadcast_start, i)
+
+        # Periodic held-out eval anchor measurement on the (unperturbed) center
+        # weights. Engine 0 holds the freshly updated weights and is the
+        # broadcast source, so it's the canonical place to measure. Done every
+        # --eval_anchor_every generations to keep cost negligible. The forced
+        # measurement at i == num_iterations - 1 guarantees the curve always
+        # has a final data point regardless of period.
+        if (
+            eval_anchor_cache
+            and args.eval_anchor_every > 0
+            and (i % args.eval_anchor_every == 0 or i == args.num_iterations - 1)
+        ):
+            eval_start = time.time()
+            eval_handle = evaluate_anchor_handle(engines[0], eval_anchor_cache)
+            eval_outputs = ray.get(eval_handle)
+            kl_eval = _postprocess_anchor_outputs(eval_outputs, eval_anchor_cache)
+            writer.add_scalar("kl/eval", kl_eval, i)
+            print(
+                f"KL eval (held-out, center weights) = {kl_eval:.4f}  "
+                f"[measured in {time.time() - eval_start:.2f}s]"
+            )
 
         # Logging per-result and timing
         if args.verbose:
