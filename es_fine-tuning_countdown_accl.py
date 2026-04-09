@@ -75,7 +75,25 @@ def parse_args():
         "--num_anchor_prompts",
         type=int,
         default=NUM_ANCHOR_PROMPTS,
-        help="Total number of anchor prompts (split evenly across --anchor_datasets).",
+        help=(
+            "Per-generation train-anchor batch size: how many anchor prompts "
+            "are scored on every candidate. With --anchor_pool_size > "
+            "num_anchor_prompts, a fresh batch is sampled from the pool each "
+            "generation (rotation). Within a generation all candidates see "
+            "the same batch so ES normalization stays consistent."
+        ),
+    )
+    parser.add_argument(
+        "--anchor_pool_size",
+        type=int,
+        default=0,
+        help=(
+            "Total pool of anchor prompts pre-scored on the base model at "
+            "startup. Each generation samples num_anchor_prompts from the pool. "
+            "0 (default) = no pool, fixed anchor (pool_size := num_anchor_prompts). "
+            "Larger pool reduces overfitting of the penalty to a specific small "
+            "set of prompts."
+        ),
     )
     parser.add_argument(
         "--anchor_max_tokens",
@@ -461,30 +479,45 @@ def main(args):
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    # Build the KL behavioral-anchor cache while all engines are still at the
+    # Build the KL behavioral-anchor pool while all engines are still at the
     # base-model weights. We do this on engine 0 only and reuse the cached
-    # token IDs / pi_ref logprobs across every candidate evaluation thereafter.
+    # token IDs / pi_ref logprobs throughout training.
     #
     # Build is gated only on `num_anchor_prompts > 0` (NOT kl_beta), so we can
     # run a measurement-only baseline (kl_beta=0) that still logs kl/* curves
     # for apples-to-apples comparison against an anchored run (kl_beta>0).
     #
-    # Optionally also build a held-out *eval* anchor (disjoint row indices,
-    # different sampling seed) that is measured per iteration but never used
-    # as a penalty target. This is what you compare against to claim the
-    # anchor generalizes beyond the prompts it was trained on.
+    # Pool semantics:
+    #   - The cache holds `pool_size` sequences total (default = num_anchor_prompts).
+    #   - Each generation samples num_anchor_prompts indices from the pool and
+    #     scores ONLY that subset on every candidate. All candidates within a
+    #     generation see the same subset so ES reward normalization stays clean.
+    #   - When pool_size == num_anchor_prompts, sampling is the identity and
+    #     behavior matches the original fixed-anchor regime.
+    #
+    # Also optionally builds a held-out *eval* anchor (disjoint row indices,
+    # different sampling seed) measured periodically on the center weights but
+    # never used as a penalty target. This is what you compare against to claim
+    # the anchor generalizes beyond the prompts it was trained on.
     anchor_cache = []
     eval_anchor_cache = []
     train_anchor_indices = {}
+    pool_size = max(args.anchor_pool_size, args.num_anchor_prompts)
 
     if args.num_anchor_prompts > 0:
         mode = "penalty" if args.kl_beta > 0.0 else "measurement-only"
+        rotation_note = (
+            f"pool={pool_size}, batch={args.num_anchor_prompts}/gen (rotated)"
+            if pool_size > args.num_anchor_prompts
+            else f"fixed batch={args.num_anchor_prompts}"
+        )
         print(
-            f"[anchor] Sampling {args.num_anchor_prompts} train prompts from "
-            f"{args.anchor_datasets} for KL anchor ({mode}, beta={args.kl_beta})..."
+            f"[anchor] Sampling {pool_size} train prompts from "
+            f"{args.anchor_datasets} for KL anchor ({mode}, beta={args.kl_beta}, "
+            f"{rotation_note})..."
         )
         anchor_prompts, train_anchor_indices = load_anchor_prompts(
-            args.anchor_datasets, args.num_anchor_prompts, args.anchor_seed
+            args.anchor_datasets, pool_size, args.anchor_seed
         )
         print(f"[anchor] Loaded {len(anchor_prompts)} train anchor prompts; sampling base-model refs...")
         anchor_cache = build_anchor_cache(
@@ -561,6 +594,20 @@ def main(args):
         seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
         seeds_perf = {}
 
+        # Sample this generation's anchor batch from the pool. All candidates
+        # within this generation will be scored on the same batch so that the
+        # KL term contributes a consistent baseline to the ES normalization.
+        # When pool size == batch size, this is just the full anchor_cache.
+        if anchor_cache and len(anchor_cache) > args.num_anchor_prompts:
+            anchor_batch = random.sample(anchor_cache, args.num_anchor_prompts)
+            if args.verbose:
+                print(
+                    f"[anchor] Generation {i}: rotated batch of "
+                    f"{len(anchor_batch)} prompts from pool of {len(anchor_cache)}"
+                )
+        else:
+            anchor_batch = anchor_cache
+
         # Round-robin scheduling
         seed_iter = iter(seeds)
         inflight = {}
@@ -575,7 +622,7 @@ def main(args):
             # Add exploration noise
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
             handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            anchor_handle = evaluate_anchor_handle(llm, anchor_cache)
+            anchor_handle = evaluate_anchor_handle(llm, anchor_batch)
             inflight[handle] = {
                 "engine": llm,
                 "engine_idx": eng_idx,
@@ -594,10 +641,12 @@ def main(args):
 
             # KL behavioral anchor: ray.get the prompt-logprob handle (likely
             # already complete since it was dispatched alongside the task call).
+            # Postprocess against the same per-generation batch the dispatch
+            # used (NOT the full pool), so token offsets line up.
             kl_estimate = 0.0
             if meta["anchor_handle"] is not None:
                 anchor_outputs = ray.get(meta["anchor_handle"])
-                kl_estimate = _postprocess_anchor_outputs(anchor_outputs, anchor_cache)
+                kl_estimate = _postprocess_anchor_outputs(anchor_outputs, anchor_batch)
             metrics["kl"] = kl_estimate
             metrics["augmented_reward"] = metrics["avg_reward"] - args.kl_beta * kl_estimate
 
@@ -626,7 +675,7 @@ def main(args):
 
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(next_seed, args.sigma, False)))
             handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            anchor_handle = evaluate_anchor_handle(llm, anchor_cache)
+            anchor_handle = evaluate_anchor_handle(llm, anchor_batch)
             inflight[handle] = {
                 "engine": llm,
                 "engine_idx": meta["engine_idx"],
