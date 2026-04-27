@@ -29,6 +29,12 @@ NUM_ENGINES = 4
 NUM_ITERATIONS = 1000
 EXPERIMENT_DIR = "es-ft-experiment"
 
+# O-LoRA defaults
+LORA_RANK = 0  # 0 = disabled (full-FT ES)
+LORA_INIT_SEED = 42
+LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+ORTH_ENERGY_THRESHOLD = 0.9
+
 # KL behavioral-anchor defaults
 KL_BETA = 0.0  # 0 = measurement only (or off entirely if NUM_ANCHOR_PROMPTS=0)
 ANCHOR_DATASETS = "mmlu,race,hellaswag"
@@ -154,6 +160,63 @@ def parse_args():
             "If > 0, keep only the last N periodic checkpoints on disk and "
             "delete older ones after each new save. The final checkpoint "
             "(written after all iterations finish) is never pruned."
+        ),
+    )
+    # O-LoRA-ES (orthogonal-subspace LoRA, hard projection)
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=LORA_RANK,
+        help=(
+            "LoRA rank for ES perturbations. 0 (default) disables LoRA and "
+            "runs full-FT ES (original behavior). >0 restricts perturbations "
+            "to (A, B) adapters around target Linear layers. The orthogonal "
+            "projection (--orth_project) is only available when this is >0."
+        ),
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default=LORA_TARGET_MODULES,
+        help=(
+            "Comma-separated substrings selecting which Linear layers get "
+            "LoRA adapters. Standard Qwen choice covers attention (q/k/v/o) "
+            "and MLP (gate/up/down) projections."
+        ),
+    )
+    parser.add_argument(
+        "--lora_init_seed",
+        type=int,
+        default=LORA_INIT_SEED,
+        help="Seed used to initialize LoRA B (A is initialized to zero).",
+    )
+    parser.add_argument(
+        "--orth_project",
+        action="store_true",
+        help=(
+            "Enable hard orthogonal projection of LoRA A onto V_ref^perp "
+            "after each ES update. V_ref is the row-orthonormal reference "
+            "subspace built from the base model's right-singular-vectors. "
+            "Requires --lora_rank > 0."
+        ),
+    )
+    parser.add_argument(
+        "--orth_energy_threshold",
+        type=float,
+        default=ORTH_ENERGY_THRESHOLD,
+        help=(
+            "Cumulative squared-singular-value energy of base-model right-"
+            "singular-vectors to keep as the reference subspace. Higher "
+            "= larger constraint subspace, more aggressive projection."
+        ),
+    )
+    parser.add_argument(
+        "--orth_max_rank",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard cap on the per-layer reference-subspace rank. "
+            "If unset, only --orth_energy_threshold gates the rank."
         ),
     )
     args = parser.parse_args()
@@ -466,6 +529,21 @@ def main(args):
         task_datas = json.load(f)
     task_datas = task_datas[:200]
 
+    # Validate O-LoRA flags before paying the engine-launch cost
+    if args.orth_project and args.lora_rank <= 0:
+        raise ValueError(
+            "--orth_project requires --lora_rank > 0 (projection acts on LoRA A only)."
+        )
+
+    # The orthogonality reference subspace V_ref is built engine-side
+    # (after init_lora) rather than from the on-disk HF checkpoint:
+    # vLLM fuses Linear layers (qkv_proj, gate_up_proj) so its
+    # parameter names diverge from HF disk names, and computing V_ref
+    # against the live W_base sidesteps the resulting key-mismatch.
+    lora_target_substrs = tuple(
+        s.strip() for s in args.lora_target_modules.split(",") if s.strip()
+    )
+
     # Launch engines
     engines, pgs = launch_engines(args.num_engines, base_model_path)
 
@@ -498,6 +576,58 @@ def main(args):
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
+
+    # Initialize LoRA side-state on every engine. Each engine independently
+    # constructs its own (A, B); since the only randomness is the shared
+    # lora_init_seed, all engines end up byte-identical without any
+    # explicit cross-engine sync. With A=0 init, the live model weights
+    # equal W_base, so the anchor cache built below still references the
+    # un-fine-tuned base behavior.
+    if args.lora_rank > 0:
+        print(
+            f"[olora] Initializing LoRA adapters on {args.num_engines} engines "
+            f"(rank={args.lora_rank}, targets={list(lora_target_substrs)})..."
+        )
+        per_engine_targets = ray.get([
+            e.collective_rpc.remote(
+                "init_lora",
+                args=(args.lora_rank, lora_target_substrs, args.lora_init_seed),
+            )
+            for e in engines
+        ])
+        target_names = per_engine_targets[0]
+        if not target_names:
+            raise RuntimeError(
+                "init_lora matched 0 weights — --lora_target_modules does "
+                "not align with model.named_parameters() naming."
+            )
+        for i, t in enumerate(per_engine_targets[1:], start=1):
+            if t != target_names:
+                raise RuntimeError(
+                    f"Engine {i} reported a different LoRA target list than "
+                    f"engine 0 — non-deterministic model construction."
+                )
+        print(f"[olora] LoRA mode active on {len(target_names)} layers per engine")
+
+        if args.orth_project:
+            print(
+                f"[olora] Building reference subspaces engine-side "
+                f"(energy>={args.orth_energy_threshold}, max_rank={args.orth_max_rank})..."
+            )
+            ranks_per_engine = ray.get([
+                e.collective_rpc.remote(
+                    "build_reference_subspaces",
+                    args=(args.orth_energy_threshold, args.orth_max_rank),
+                )
+                for e in engines
+            ])
+            ranks0 = ranks_per_engine[0]
+            r_values = sorted(ranks0.values())
+            print(
+                f"[olora] V_ref built for {len(ranks0)} layers per engine; "
+                f"per-layer rank min/median/max = "
+                f"{r_values[0]}/{r_values[len(r_values)//2]}/{r_values[-1]}"
+            )
 
     # Build the KL behavioral-anchor pool while all engines are still at the
     # base-model weights. We do this on engine 0 only and reuse the cached
@@ -769,6 +899,29 @@ def main(args):
         if args.verbose:
             print(f"Applied perturbations in {time.time() - perturb_start}s")
         writer.add_scalar("time/perturbation_application", time.time() - perturb_start, i)
+
+        # O-LoRA hard projection: snap A back onto V_ref^perp on engine 0
+        # *before* the broadcast, so all engines receive the projected
+        # weights. We log the residual pre/post to confirm projection is
+        # actually doing something (pre should grow as ES drifts; post
+        # should hover at fp16 noise floor).
+        if args.orth_project:
+            orth_start = time.time()
+            residual_pre = ray.get(
+                engines[0].collective_rpc.remote("measure_lora_orth_residual")
+            )
+            ray.get(engines[0].collective_rpc.remote("project_lora_orthogonal"))
+            residual_post = ray.get(
+                engines[0].collective_rpc.remote("measure_lora_orth_residual")
+            )
+            writer.add_scalar("orth/residual_pre", residual_pre, i)
+            writer.add_scalar("orth/residual_post", residual_post, i)
+            writer.add_scalar("time/orth_projection", time.time() - orth_start, i)
+            if args.verbose:
+                print(
+                    f"[olora] orth residual pre={residual_pre:.3e} "
+                    f"post={residual_post:.3e}  ({time.time() - orth_start:.2f}s)"
+                )
 
         # Broadcast updated weights from engine 0 to all engines (avoid CPU copies)
         broadcast_start = time.time()
