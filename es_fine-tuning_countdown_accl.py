@@ -595,14 +595,19 @@ def main(args):
             )
             for e in engines
         ])
-        target_names = per_engine_targets[0]
+        # collective_rpc returns a list across TP workers (length == tp_size).
+        # We run tp_size=1 per engine, so unwrap the inner [0] to get the
+        # actual return value from the single worker.
+        target_names = per_engine_targets[0][0]
         if not target_names:
             raise RuntimeError(
                 "init_lora matched 0 weights — --lora_target_modules does "
-                "not align with model.named_parameters() naming."
+                "not align with model.named_parameters() naming. vLLM often "
+                "fuses qkv_proj and gate_up_proj; try --lora_target_modules "
+                "qkv_proj,o_proj,gate_up_proj,down_proj."
             )
         for i, t in enumerate(per_engine_targets[1:], start=1):
-            if t != target_names:
+            if t[0] != target_names:
                 raise RuntimeError(
                     f"Engine {i} reported a different LoRA target list than "
                     f"engine 0 — non-deterministic model construction."
@@ -621,7 +626,7 @@ def main(args):
                 )
                 for e in engines
             ])
-            ranks0 = ranks_per_engine[0]
+            ranks0 = ranks_per_engine[0][0]  # unwrap TP-worker list
             r_values = sorted(ranks0.values())
             print(
                 f"[olora] V_ref built for {len(ranks0)} layers per engine; "
@@ -907,13 +912,14 @@ def main(args):
         # should hover at fp16 noise floor).
         if args.orth_project:
             orth_start = time.time()
+            # collective_rpc returns a TP-worker list (length 1 here); unwrap.
             residual_pre = ray.get(
                 engines[0].collective_rpc.remote("measure_lora_orth_residual")
-            )
+            )[0]
             ray.get(engines[0].collective_rpc.remote("project_lora_orthogonal"))
             residual_post = ray.get(
                 engines[0].collective_rpc.remote("measure_lora_orth_residual")
-            )
+            )[0]
             writer.add_scalar("orth/residual_pre", residual_pre, i)
             writer.add_scalar("orth/residual_post", residual_post, i)
             writer.add_scalar("time/orth_projection", time.time() - orth_start, i)
