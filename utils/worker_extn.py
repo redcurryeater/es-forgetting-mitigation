@@ -199,10 +199,12 @@ class WorkerExtension:
         HF disk names. By running SVD on `self._W_base[name]`, the keys
         line up with the LoRA targets by construction.
 
-        SVD is run in fp32 on the GPU. Only the top-`s` rows of Vh are
-        kept, where `s` is the smallest rank such that the cumulative
-        squared-singular-value energy reaches `energy_threshold`. If
-        `max_rank` is set, `s` is capped at that value.
+        SVD runs on CPU (vLLM has reserved most of the GPU for the KV
+        cache, so a GPU-side SVD workspace OOMs immediately on smaller
+        cards like L4). Only the top-`s` rows of Vh are kept and copied
+        back to the GPU as fp32, where `s` is the smallest rank such
+        that the cumulative squared-singular-value energy reaches
+        `energy_threshold`. If `max_rank` is set, `s` is capped there.
 
         Returns a dict mapping target name -> kept rank (for logging).
         """
@@ -213,8 +215,11 @@ class WorkerExtension:
 
         ranks: dict[str, int] = {}
         for name in self._lora_target_names:
-            W = self._W_base[name].float()  # (d, k), fp32 for SVD stability
-            _, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            target_device = self._W_base[name].device
+            # Round-trip to CPU for the SVD workspace; W tensors are small
+            # enough (a few MB each) that this is fast in aggregate.
+            W_cpu = self._W_base[name].detach().to(device="cpu", dtype=torch.float32)
+            _, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
             sq = S * S
             cum = sq.cumsum(0) / sq.sum().clamp_min(1e-30)
             s = int((cum < float(energy_threshold)).sum().item()) + 1
@@ -222,9 +227,10 @@ class WorkerExtension:
                 s = min(s, int(max_rank))
             s = max(s, 1)
             self._V_ref[name] = Vh[:s].contiguous().to(
-                device=W.device, dtype=torch.float32
+                device=target_device, dtype=torch.float32
             )
             ranks[name] = s
+            del W_cpu, S, Vh
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()

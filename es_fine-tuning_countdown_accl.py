@@ -219,6 +219,19 @@ def parse_args():
             "If unset, only --orth_energy_threshold gates the rank."
         ),
     )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help=(
+            "Fraction of each GPU's memory vLLM is allowed to claim "
+            "(model weights + KV cache + activation buffers). The default "
+            "0.9 mirrors vLLM's own default and works on A100/H100. On "
+            "smaller cards (e.g. L4 24GB) lower to ~0.8 so the LoRA "
+            "side-state (W_base copy, V_ref, projection workspace) has "
+            "headroom — otherwise build_reference_subspaces OOMs."
+        ),
+    )
     args = parser.parse_args()
     # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
@@ -239,7 +252,7 @@ class ESNcclLLM(LLM):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         super().__init__(*args, **kwargs)
 
-def launch_engines(num_engines, model_name):
+def launch_engines(num_engines, model_name, gpu_memory_utilization=0.9):
     # Strict 1-GPU isolation via PGs
     pgs = [placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached") for _ in range(num_engines)]
     ray.get([pg.ready() for pg in pgs])
@@ -262,6 +275,7 @@ def launch_engines(num_engines, model_name):
             dtype="float16",
             enable_prefix_caching=False,
             enforce_eager=False,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         for strategy in strategies
     ]
@@ -545,7 +559,9 @@ def main(args):
     )
 
     # Launch engines
-    engines, pgs = launch_engines(args.num_engines, base_model_path)
+    engines, pgs = launch_engines(
+        args.num_engines, base_model_path, args.gpu_memory_utilization
+    )
 
     # Init inter-engine communicator once
     master_address = get_ip()
