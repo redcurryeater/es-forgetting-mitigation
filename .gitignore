@@ -1,0 +1,44 @@
+# Logs (TensorBoard event files, training logs, checkpoints)
+logs/
+**/logs/
+*.tfevents.*
+*:Zone.Identifier
+
+# Figures (regenerated from notebooks)
+figures/
+**/figures/
+
+# Model weights
+*.pth
+*.safetensors
+
+# Benchmark outputs
+bench_out/
+**/bench_out/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Virtual envs
+venv/
+.venv/
+es/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fdb_latexmk
+*.fls

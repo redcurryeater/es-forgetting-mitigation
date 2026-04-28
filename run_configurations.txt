@@ -1,0 +1,56 @@
+Baseline Run 
+
+!python es_fine-tuning_countdown_accl.py \
+#   --model_name Qwen/Qwen2.5-1.5B-Instruct \
+#   --cuda_devices 0 \
+#   --num_engines 1 \
+#   --population_size 30 \
+#   --num_iterations 150 \
+#   --kl_beta 1.0 \
+#   --num_anchor_prompts 32 \
+#   --anchor_pool_size 512 \
+#   --eval_anchor_seed 9999 \
+#   --eval_anchor_every 10 \
+#   --global_seed 1 \
+#   --anchor_seed 1234 \
+#   --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/anchored_rotated_beta1
+
+With KL beta = 1
+
+!python es_fine-tuning_countdown_accl.py \
+#   --model_name Qwen/Qwen2.5-1.5B-Instruct \
+#   --cuda_devices 0 \
+#   --num_engines 1 \
+#   --population_size 30 \
+#   --num_iterations 150 \
+#   --kl_beta 0 \
+#   --num_anchor_prompts 32 \
+#   --anchor_pool_size 128 \
+#   --eval_anchor_seed 9999 \
+#   --eval_anchor_every 10 \
+#   --global_seed 1 \
+#   --anchor_seed 1234 \
+#   --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/baseline_measure_only \
+#   --checkpoint_every 25
+
+
+OLora smoke test
+
+!python es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 3 \
+  --population_size 4 \
+  --num_engines 1 \
+  --cuda_devices 0,1 \
+  --lora_rank 8 \
+  --orth_project \
+  --orth_max_rank 32 \
+  --num_anchor_prompts 4 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 4 \
+  --eval_anchor_every 1 \
+  --verbose \
+  --global_seed 0 \
+  --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/
+
+  
