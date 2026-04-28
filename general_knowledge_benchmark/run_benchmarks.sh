@@ -48,7 +48,7 @@ mkdir -p "$OUT_DIR/results"
 if [[ "$MODEL" == *.pth ]]; then
   HF_DIR="$OUT_DIR/hf_$LABEL"
   echo "=== [convert] $MODEL -> $HF_DIR ==="
-  python export_checkpoint_to_hf.py \
+  python3 export_checkpoint_to_hf.py \
     --base_model "$BASE_MODEL" \
     --ckpt "$MODEL" \
     --out "$HF_DIR" \
