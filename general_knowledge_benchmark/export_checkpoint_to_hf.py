@@ -44,11 +44,11 @@ def convert(vllm_sd, cfg):
         if k.startswith("__"):  # skip lora bookkeeping if present
             continue
         if "qkv_proj" in k:
-            base = k.replace("qkv_proj", "")
+            prefix, suffix = k.split("qkv_proj")
             q, kk, vv = split_qkv(v, num_heads, num_kv_heads, head_dim)
-            hf_sd[base + "q_proj" + k.split("qkv_proj")[1]] = q
-            hf_sd[base + "k_proj" + k.split("qkv_proj")[1]] = kk
-            hf_sd[base + "v_proj" + k.split("qkv_proj")[1]] = vv
+            hf_sd[f"{prefix}q_proj{suffix}"] = q
+            hf_sd[f"{prefix}k_proj{suffix}"] = kk
+            hf_sd[f"{prefix}v_proj{suffix}"] = vv
         elif "gate_up_proj" in k:
             gate, up = split_gate_up(v, intermediate_size)
             hf_sd[k.replace("gate_up_proj", "gate_proj")] = gate
@@ -77,6 +77,15 @@ def main():
 
     print(f"[load] checkpoint {args.ckpt}")
     vllm_sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+
+    # Debug: show what naming convention the checkpoint uses for layer 0.
+    layer0_keys = sorted(k for k in vllm_sd.keys()
+                         if "layers.0." in k or k.startswith("__"))
+    print(f"[debug] {len(vllm_sd)} total keys; layer-0 / lora keys:")
+    for k in layer0_keys:
+        v = vllm_sd[k]
+        shape = tuple(v.shape) if hasattr(v, "shape") else type(v).__name__
+        print(f"  {k}  {shape}")
 
     print("[convert] splitting fused qkv_proj / gate_up_proj")
     hf_sd = convert(vllm_sd, model.config)
