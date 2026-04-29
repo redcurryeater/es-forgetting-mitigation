@@ -369,9 +369,15 @@ class WorkerExtension:
     # ------------------------------------------------------------------
 
     def init_svb(self, target_module_substrs):
-        """Cache W_base in fp32 for every weight whose name contains one
-        of `target_module_substrs`. Engine-0-only invocation pattern from
+        """Cache W_base in fp32 *on CPU* for every weight whose name contains
+        one of `target_module_substrs`. Engine-0-only invocation pattern from
         the trainer.
+
+        We hold W_base on CPU (pinned for fast H2D) because vLLM has already
+        reserved most of the GPU for the KV cache; an on-device fp32 copy of
+        ~700MB of fp16 weights doubles to ~1.4GB and OOMs on 24GB cards. The
+        per-generation truncation pays one H2D copy per target layer, which
+        empirically is dominated by the SVD itself.
 
         Returns the ordered list of target names so the trainer can
         sanity-check the mapping (mirrors init_lora's contract).
@@ -381,6 +387,7 @@ class WorkerExtension:
         self._svb_param_ref: dict[str, torch.nn.Parameter] = {}
         self._W_base_svb: dict[str, torch.Tensor] = {}
 
+        pin = torch.cuda.is_available()
         for name, p in self.model_runner.model.named_parameters():
             if not name.endswith(".weight"):
                 continue
@@ -390,14 +397,17 @@ class WorkerExtension:
                 continue
             self._svb_target_names.append(name)
             self._svb_param_ref[name] = p
-            # fp32 copy, on-device. ~2x weight memory for target layers
-            # only (q/k/v/o + gate/up/down for Qwen2.5-1.5B is ~1GB at
-            # fp32). Avoids fp16 round-off when subtracting near-equal
-            # weights at later generations.
-            self._W_base_svb[name] = p.data.detach().to(dtype=torch.float32).clone()
+            cpu_copy = p.data.detach().to(device="cpu", dtype=torch.float32).clone()
+            if pin:
+                try:
+                    cpu_copy = cpu_copy.pin_memory()
+                except RuntimeError:
+                    pass
+            self._W_base_svb[name] = cpu_copy
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         self._svb_mode = True
         return list(self._svb_target_names)
 
@@ -432,21 +442,13 @@ class WorkerExtension:
 
         for name in self._svb_target_names:
             p = self._svb_param_ref[name]
-            W_base = self._W_base_svb[name]
-            dW = p.data.to(dtype=torch.float32) - W_base
-            drift_frob2_pre += float(dW.pow(2).sum().item())
+            W_base_cpu = self._W_base_svb[name]  # fp32 CPU
+            # Pull the live weight to CPU in fp32 for the diff/SVD.
+            W_live_cpu = p.data.detach().to(device="cpu", dtype=torch.float32)
+            dW_cpu = W_live_cpu - W_base_cpu
+            drift_frob2_pre += float(dW_cpu.pow(2).sum().item())
 
-            try:
-                U, S, Vh = torch.linalg.svd(dW, full_matrices=False)
-            except RuntimeError:
-                # GPU OOM or numerical issue: retry on CPU. Mirrors the
-                # decision in build_reference_subspaces.
-                dW_cpu = dW.detach().to(device="cpu")
-                U_c, S_c, Vh_c = torch.linalg.svd(dW_cpu, full_matrices=False)
-                U = U_c.to(device=p.device)
-                S = S_c.to(device=p.device)
-                Vh = Vh_c.to(device=p.device)
-                del dW_cpu, U_c, S_c, Vh_c
+            U, S, Vh = torch.linalg.svd(dW_cpu, full_matrices=False)
 
             if rank > 0:
                 k = min(int(rank), int(S.shape[0]))
@@ -460,14 +462,14 @@ class WorkerExtension:
             ranks_kept[name] = k
 
             S_k = S[:k]
-            dW_trunc = (U[:, :k] * S_k.unsqueeze(0)) @ Vh[:k]
-            drift_frob2_post += float(dW_trunc.pow(2).sum().item())
+            dW_trunc_cpu = (U[:, :k] * S_k.unsqueeze(0)) @ Vh[:k]
+            drift_frob2_post += float(dW_trunc_cpu.pow(2).sum().item())
             spectral_norm_post = max(spectral_norm_post, float(S_k[0].item()))
 
-            new_W = (W_base + dW_trunc).to(dtype=p.dtype)
-            p.data.copy_(new_W)
+            new_W_cpu = (W_base_cpu + dW_trunc_cpu).to(dtype=p.dtype)
+            p.data.copy_(new_W_cpu.to(device=p.device, non_blocking=True))
 
-            del dW, U, S, Vh, dW_trunc, new_W
+            del dW_cpu, U, S, Vh, dW_trunc_cpu, new_W_cpu, W_live_cpu
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -482,20 +484,19 @@ class WorkerExtension:
 
     def measure_svb_drift_stats(self):
         """Read-only telemetry: aggregate ‖dW‖²_F and max σ_max across
-        SVB target weights. Useful between truncations."""
+        SVB target weights. Useful between truncations. Computed on CPU
+        because W_base lives there."""
         if not getattr(self, "_svb_mode", False):
             return {"drift_frob2": 0.0, "spectral_norm": 0.0}
         drift_frob2 = 0.0
         spectral_norm = 0.0
         for name in self._svb_target_names:
             p = self._svb_param_ref[name]
-            W_base = self._W_base_svb[name]
-            dW = p.data.to(dtype=torch.float32) - W_base
-            drift_frob2 += float(dW.pow(2).sum().item())
-            try:
-                S = torch.linalg.svdvals(dW)
-            except RuntimeError:
-                S = torch.linalg.svdvals(dW.to(device="cpu"))
+            W_base_cpu = self._W_base_svb[name]
+            W_live_cpu = p.data.detach().to(device="cpu", dtype=torch.float32)
+            dW_cpu = W_live_cpu - W_base_cpu
+            drift_frob2 += float(dW_cpu.pow(2).sum().item())
+            S = torch.linalg.svdvals(dW_cpu)
             spectral_norm = max(spectral_norm, float(S[0].item()))
-            del dW, S
+            del dW_cpu, S, W_live_cpu
         return {"drift_frob2": drift_frob2, "spectral_norm": spectral_norm}
