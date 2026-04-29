@@ -35,6 +35,12 @@ LORA_INIT_SEED = 42
 LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 ORTH_ENERGY_THRESHOLD = 0.9
 
+# Singular Value Bottlenecking (SVB) defaults
+SVB_RANK = 0  # 0 = disabled
+SVB_ENERGY_THRESHOLD = 0.0  # only used if SVB_RANK == 0 and this > 0
+SVB_TARGET_MODULES = LORA_TARGET_MODULES
+SVB_TRUNCATE_EVERY = 1
+
 # KL behavioral-anchor defaults
 KL_BETA = 0.0  # 0 = measurement only (or off entirely if NUM_ANCHOR_PROMPTS=0)
 ANCHOR_DATASETS = "mmlu,race,hellaswag"
@@ -218,6 +224,53 @@ def parse_args():
             "Optional hard cap on the per-layer reference-subspace rank. "
             "If unset, only --orth_energy_threshold gates the rank."
         ),
+    )
+    # Singular Value Bottlenecking (SVB): post-update spectral truncation of
+    # the cumulative drift dW = W - W_base on target weights. Mutually
+    # exclusive with --lora_rank > 0; composable with --kl_beta.
+    parser.add_argument(
+        "--svb_rank",
+        type=int,
+        default=SVB_RANK,
+        help=(
+            "Per-layer rank to keep when truncating the cumulative drift "
+            "dW = W - W_base each generation. 0 (default) disables SVB. "
+            ">0 enables SVB; mutually exclusive with --lora_rank > 0."
+        ),
+    )
+    parser.add_argument(
+        "--svb_energy_threshold",
+        type=float,
+        default=SVB_ENERGY_THRESHOLD,
+        help=(
+            "Cumulative squared-singular-value energy of the drift to keep. "
+            "Only consulted if --svb_rank == 0; >0 enables SVB with adaptive "
+            "rank per layer per generation."
+        ),
+    )
+    parser.add_argument(
+        "--svb_max_rank",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard cap on per-layer SVB rank when using "
+            "--svb_energy_threshold."
+        ),
+    )
+    parser.add_argument(
+        "--svb_target_modules",
+        type=str,
+        default=SVB_TARGET_MODULES,
+        help=(
+            "Comma-separated substrings selecting which Linear layers' "
+            "drift gets truncated. Defaults to the same list as O-LoRA."
+        ),
+    )
+    parser.add_argument(
+        "--svb_truncate_every",
+        type=int,
+        default=SVB_TRUNCATE_EVERY,
+        help="Truncate drift every N generations (default 1).",
     )
     parser.add_argument(
         "--gpu_memory_utilization",
@@ -549,6 +602,17 @@ def main(args):
             "--orth_project requires --lora_rank > 0 (projection acts on LoRA A only)."
         )
 
+    # SVB is mutually exclusive with O-LoRA (competing structural fixes).
+    svb_enabled = args.svb_rank > 0 or args.svb_energy_threshold > 0
+    if svb_enabled and args.lora_rank > 0:
+        raise ValueError(
+            "--svb_rank/--svb_energy_threshold and --lora_rank are mutually "
+            "exclusive structural-fix modes."
+        )
+    svb_target_substrs = tuple(
+        s.strip() for s in args.svb_target_modules.split(",") if s.strip()
+    )
+
     # The orthogonality reference subspace V_ref is built engine-side
     # (after init_lora) rather than from the on-disk HF checkpoint:
     # vLLM fuses Linear layers (qkv_proj, gate_up_proj) so its
@@ -649,6 +713,33 @@ def main(args):
                 f"per-layer rank min/median/max = "
                 f"{r_values[0]}/{r_values[len(r_values)//2]}/{r_values[-1]}"
             )
+
+    # Singular Value Bottlenecking init: cache W_base in fp32 for the
+    # target weights on engine 0 only. Engine 0 is the canonical update
+    # site (ES updates and SVD truncation both run there); other engines
+    # only receive the post-truncation broadcast and never need W_base.
+    if svb_enabled:
+        mode_desc = (
+            f"rank={args.svb_rank}"
+            if args.svb_rank > 0
+            else f"energy>={args.svb_energy_threshold}"
+        )
+        print(
+            f"[svb] Initializing SVB on engine 0 ({mode_desc}, "
+            f"max_rank={args.svb_max_rank}, every={args.svb_truncate_every}, "
+            f"targets={list(svb_target_substrs)})..."
+        )
+        svb_target_names = ray.get(engines[0].collective_rpc.remote(
+            "init_svb", args=(svb_target_substrs,)
+        ))[0]
+        if not svb_target_names:
+            raise RuntimeError(
+                "init_svb matched 0 weights — --svb_target_modules does "
+                "not align with model.named_parameters() naming. vLLM often "
+                "fuses qkv_proj and gate_up_proj; try --svb_target_modules "
+                "qkv_proj,o_proj,gate_up_proj,down_proj."
+            )
+        print(f"[svb] SVB active on {len(svb_target_names)} layers (engine 0)")
 
     # Build the KL behavioral-anchor pool while all engines are still at the
     # base-model weights. We do this on engine 0 only and reuse the cached
@@ -920,6 +1011,30 @@ def main(args):
         if args.verbose:
             print(f"Applied perturbations in {time.time() - perturb_start}s")
         writer.add_scalar("time/perturbation_application", time.time() - perturb_start, i)
+
+        # SVB: post-update truncation of cumulative drift on engine 0,
+        # *before* the broadcast so other engines receive the truncated
+        # weights directly. Mutually exclusive with O-LoRA by upfront
+        # validation, so only one of the two blocks fires per iteration.
+        if svb_enabled and (i % args.svb_truncate_every == 0):
+            svb_start = time.time()
+            svb_stats = ray.get(engines[0].collective_rpc.remote(
+                "truncate_drift_svd",
+                args=(args.svb_rank, args.svb_energy_threshold, args.svb_max_rank),
+            ))[0]
+            writer.add_scalar("svb/drift_frob2_pre",  svb_stats["drift_frob2_pre"],  i)
+            writer.add_scalar("svb/drift_frob2_post", svb_stats["drift_frob2_post"], i)
+            writer.add_scalar("svb/spectral_norm_post", svb_stats["spectral_norm_post"], i)
+            writer.add_scalar("time/svb_truncation",  time.time() - svb_start, i)
+            if args.verbose:
+                ranks = sorted(svb_stats["ranks_kept"].values())
+                print(
+                    f"[svb] truncated drift: "
+                    f"‖dW‖²_F {svb_stats['drift_frob2_pre']:.3e} → "
+                    f"{svb_stats['drift_frob2_post']:.3e}; ranks min/med/max = "
+                    f"{ranks[0]}/{ranks[len(ranks)//2]}/{ranks[-1]}  "
+                    f"({time.time() - svb_start:.2f}s)"
+                )
 
         # O-LoRA hard projection: snap A back onto V_ref^perp on engine 0
         # *before* the broadcast, so all engines receive the projected

@@ -355,3 +355,147 @@ class WorkerExtension:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return True
+
+    # ------------------------------------------------------------------
+    # Singular Value Bottlenecking (SVB) mode
+    #
+    # Independent of LoRA mode. SVB does not change perturbation behavior
+    # (perturb_self_weights / restore_self_weights iterate every parameter
+    # as in baseline ES); the trainer instead invokes truncate_drift_svd()
+    # once per generation after the ES update on engine 0, before the
+    # NCCL broadcast. The cumulative drift dW = W - W_base on each target
+    # weight is replaced with its rank-k truncation, where k is set by
+    # explicit rank or cumulative-energy threshold.
+    # ------------------------------------------------------------------
+
+    def init_svb(self, target_module_substrs):
+        """Cache W_base in fp32 for every weight whose name contains one
+        of `target_module_substrs`. Engine-0-only invocation pattern from
+        the trainer.
+
+        Returns the ordered list of target names so the trainer can
+        sanity-check the mapping (mirrors init_lora's contract).
+        """
+        substrs = tuple(target_module_substrs)
+        self._svb_target_names: list[str] = []
+        self._svb_param_ref: dict[str, torch.nn.Parameter] = {}
+        self._W_base_svb: dict[str, torch.Tensor] = {}
+
+        for name, p in self.model_runner.model.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            if p.ndim != 2:
+                continue
+            if not any(sub in name for sub in substrs):
+                continue
+            self._svb_target_names.append(name)
+            self._svb_param_ref[name] = p
+            # fp32 copy, on-device. ~2x weight memory for target layers
+            # only (q/k/v/o + gate/up/down for Qwen2.5-1.5B is ~1GB at
+            # fp32). Avoids fp16 round-off when subtracting near-equal
+            # weights at later generations.
+            self._W_base_svb[name] = p.data.detach().to(dtype=torch.float32).clone()
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._svb_mode = True
+        return list(self._svb_target_names)
+
+    def truncate_drift_svd(
+        self,
+        rank: int = 0,
+        energy_threshold: float = 0.0,
+        max_rank: int | None = None,
+    ):
+        """For each cached SVB target: SVD(W - W_base), keep top-k, write
+        W <- W_base + U[:, :k] diag(S[:k]) Vh[:k] back into the live param.
+
+        Rank selection:
+          * If `rank > 0`: k = min(rank, len(S)) for every layer.
+          * Else: k = smallest index s.t. cum sum of squared singular values
+            reaches `energy_threshold`, capped by `max_rank` if set.
+            Floored at 1.
+
+        Returns a dict with aggregate logging stats.
+        """
+        if not getattr(self, "_svb_mode", False):
+            raise RuntimeError("truncate_drift_svd requires init_svb() first")
+        if rank <= 0 and energy_threshold <= 0.0:
+            raise ValueError(
+                "truncate_drift_svd needs rank > 0 or energy_threshold > 0"
+            )
+
+        ranks_kept: dict[str, int] = {}
+        drift_frob2_pre = 0.0
+        drift_frob2_post = 0.0
+        spectral_norm_post = 0.0
+
+        for name in self._svb_target_names:
+            p = self._svb_param_ref[name]
+            W_base = self._W_base_svb[name]
+            dW = p.data.to(dtype=torch.float32) - W_base
+            drift_frob2_pre += float(dW.pow(2).sum().item())
+
+            try:
+                U, S, Vh = torch.linalg.svd(dW, full_matrices=False)
+            except RuntimeError:
+                # GPU OOM or numerical issue: retry on CPU. Mirrors the
+                # decision in build_reference_subspaces.
+                dW_cpu = dW.detach().to(device="cpu")
+                U_c, S_c, Vh_c = torch.linalg.svd(dW_cpu, full_matrices=False)
+                U = U_c.to(device=p.device)
+                S = S_c.to(device=p.device)
+                Vh = Vh_c.to(device=p.device)
+                del dW_cpu, U_c, S_c, Vh_c
+
+            if rank > 0:
+                k = min(int(rank), int(S.shape[0]))
+            else:
+                sq = S * S
+                cum = sq.cumsum(0) / sq.sum().clamp_min(1e-30)
+                k = int((cum < float(energy_threshold)).sum().item()) + 1
+                if max_rank is not None:
+                    k = min(k, int(max_rank))
+            k = max(k, 1)
+            ranks_kept[name] = k
+
+            S_k = S[:k]
+            dW_trunc = (U[:, :k] * S_k.unsqueeze(0)) @ Vh[:k]
+            drift_frob2_post += float(dW_trunc.pow(2).sum().item())
+            spectral_norm_post = max(spectral_norm_post, float(S_k[0].item()))
+
+            new_W = (W_base + dW_trunc).to(dtype=p.dtype)
+            p.data.copy_(new_W)
+
+            del dW, U, S, Vh, dW_trunc, new_W
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return {
+            "ranks_kept": ranks_kept,
+            "drift_frob2_pre": drift_frob2_pre,
+            "drift_frob2_post": drift_frob2_post,
+            "spectral_norm_post": spectral_norm_post,
+        }
+
+    def measure_svb_drift_stats(self):
+        """Read-only telemetry: aggregate ‖dW‖²_F and max σ_max across
+        SVB target weights. Useful between truncations."""
+        if not getattr(self, "_svb_mode", False):
+            return {"drift_frob2": 0.0, "spectral_norm": 0.0}
+        drift_frob2 = 0.0
+        spectral_norm = 0.0
+        for name in self._svb_target_names:
+            p = self._svb_param_ref[name]
+            W_base = self._W_base_svb[name]
+            dW = p.data.to(dtype=torch.float32) - W_base
+            drift_frob2 += float(dW.pow(2).sum().item())
+            try:
+                S = torch.linalg.svdvals(dW)
+            except RuntimeError:
+                S = torch.linalg.svdvals(dW.to(device="cpu"))
+            spectral_norm = max(spectral_norm, float(S[0].item()))
+            del dW, S
+        return {"drift_frob2": drift_frob2, "spectral_norm": spectral_norm}

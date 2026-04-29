@@ -1,5 +1,22 @@
 Baseline Run 
 
+python es_fine-tuning_countdown_accl.py \
+   --model_name Qwen/Qwen2.5-1.5B-Instruct \
+   --cuda_devices 0 \
+   --num_engines 1 \
+   --population_size 30 \
+   --num_iterations 150 \
+   --kl_beta 0 \
+   --num_anchor_prompts 32 \
+   --anchor_pool_size 128 \
+   --eval_anchor_seed 9999 \
+   --eval_anchor_every 10 \
+   --global_seed 1 \
+   --anchor_seed 1234 \
+   --experiment_dir logs/baseline_speedtest \
+
+With KL beta = 1
+
 !python es_fine-tuning_countdown_accl.py \
 #   --model_name Qwen/Qwen2.5-1.5B-Instruct \
 #   --cuda_devices 0 \
@@ -15,42 +32,67 @@ Baseline Run
 #   --anchor_seed 1234 \
 #   --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/anchored_rotated_beta1
 
-With KL beta = 1
-
-!python es_fine-tuning_countdown_accl.py \
-#   --model_name Qwen/Qwen2.5-1.5B-Instruct \
-#   --cuda_devices 0 \
-#   --num_engines 1 \
-#   --population_size 30 \
-#   --num_iterations 150 \
-#   --kl_beta 0 \
-#   --num_anchor_prompts 32 \
-#   --anchor_pool_size 128 \
-#   --eval_anchor_seed 9999 \
-#   --eval_anchor_every 10 \
-#   --global_seed 1 \
-#   --anchor_seed 1234 \
-#   --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/baseline_measure_only \
-#   --checkpoint_every 25
-
-
 OLora smoke test
 
-!python es_fine-tuning_countdown_accl.py \
+  python3 es_fine-tuning_countdown_accl.py \
   --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --num_iterations 3 \
-  --population_size 4 \
+  --num_iterations 1 \
+  --population_size 30 \
   --num_engines 1 \
-  --cuda_devices 0,1 \
-  --lora_rank 8 \
+  --cuda_devices 0 \
+  --lora_rank 16 \
+  --lora_target_modules qkv_proj,o_proj,gate_up_proj,down_proj \
   --orth_project \
-  --orth_max_rank 32 \
-  --num_anchor_prompts 4 \
+  --orth_energy_threshold 0.9 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
   --eval_anchor_seed 9999 \
-  --num_eval_anchor_prompts 4 \
-  --eval_anchor_every 1 \
-  --verbose \
+  --num_eval_anchor_prompts 32 \
+  --eval_anchor_every 5 \
+  --keep_last_n_checkpoints 3 \
   --global_seed 0 \
-  --experiment_dir /content/drive/MyDrive/es_kl_anchor_runs/
+  --gpu_memory_utilization 0.7 \
+  --experiment_dir es-ft-olora-1
 
-  
+O-lora 
+
+ python3 es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 150 \
+  --population_size 30 \
+  --num_engines 1 \
+  --cuda_devices 0 \
+  --lora_rank 16 \
+  --lora_target_modules qkv_proj,o_proj,gate_up_proj,down_proj \
+  --orth_project \
+  --orth_energy_threshold 0.9 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 32 \
+  --eval_anchor_every 5 \
+  --global_seed 0 \
+  --gpu_memory_utilization 0.7 \
+  --experiment_dir logs/es-ft-olora-150
+
+KL and Olora
+
+  python3 es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 150 \
+  --population_size 30 \
+  --num_engines 1 \
+  --cuda_devices 0 \
+  --lora_rank 16 \
+  --lora_target_modules qkv_proj,o_proj,gate_up_proj,down_proj \
+  --orth_project \
+  --orth_energy_threshold 0.9 \
+  --kl_beta 1.0 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 64 \
+  --eval_anchor_every 10 \
+  --global_seed 0 \
+  --gpu_memory_utilization 0.8 \
+  --experiment_dir es-ft-olora-kl-150
