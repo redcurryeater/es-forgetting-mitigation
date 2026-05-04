@@ -35,6 +35,7 @@ class WorkerExtension:
     - init_inter_engine_group(master_address, master_port, rank, world_size)
     - broadcast_all_weights(src_rank)
     - save_self_weights_to_disk(filepath)
+    - load_self_weights_from_disk(filepath)
 
     LoRA-mode-only:
     - init_lora(rank, target_module_substrs, init_seed)
@@ -110,6 +111,25 @@ class WorkerExtension:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         time.sleep(0.1)
+        return True
+
+    def load_self_weights_from_disk(self, filepath):
+        state_dict = torch.load(filepath, map_location="cpu")
+        lora_A = state_dict.pop("__lora_A__", None)
+        lora_B = state_dict.pop("__lora_B__", None)
+        with torch.no_grad():
+            for name, p in self.model_runner.model.named_parameters():
+                if name in state_dict:
+                    p.data.copy_(state_dict[name].to(p.device, dtype=p.dtype))
+        if lora_A is not None and getattr(self, "_lora_mode", False):
+            for k, v in lora_A.items():
+                self._lora_A[k].data.copy_(v.to(self._lora_A[k].device))
+            for k, v in lora_B.items():
+                self._lora_B[k].data.copy_(v.to(self._lora_B[k].device))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         return True
 
     # ------------------------------------------------------------------

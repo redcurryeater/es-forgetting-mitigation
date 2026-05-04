@@ -13,7 +13,23 @@ python es_fine-tuning_countdown_accl.py \
    --eval_anchor_every 10 \
    --global_seed 1 \
    --anchor_seed 1234 \
-   --experiment_dir logs/baseline_speedtest \
+   --experiment_dir logs/baseline_speedtest 
+
+python es_fine-tuning_countdown_accl.py \
+   --model_name Qwen/Qwen2.5-1.5B-Instruct \
+   --cuda_devices 0 \
+   --num_engines 1 \
+   --population_size 30 \
+   --num_iterations 500 \
+   --kl_beta 0 \
+   --num_anchor_prompts 32 \
+   --anchor_pool_size 512 \
+   --eval_anchor_seed 9999 \
+   --eval_anchor_every 10 \
+   --global_seed 1 \
+   --anchor_seed 1234 \
+   --experiment_dir logs/baseline_500
+
 
 With KL beta = 1
 
@@ -96,3 +112,67 @@ KL and Olora
   --global_seed 0 \
   --gpu_memory_utilization 0.8 \
   --experiment_dir es-ft-olora-kl-150
+
+SVB test
+
+  python es_fine-tuning_countdown_accl.py --num_iterations 1 --population_size 4 \
+  --num_engines 1 --cuda_devices 0 --svb_rank 4 --verbose
+
+SVB smoke test (mirrors O-LoRA smoke test, swap structural fix)
+
+  python3 es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 1 \
+  --population_size 30 \
+  --num_engines 1 \
+  --cuda_devices 0 \
+  --svb_rank 16 \
+  --svb_truncate_every 1 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 32 \
+  --eval_anchor_every 5 \
+  --keep_last_n_checkpoints 3 \
+  --global_seed 0 \
+  --gpu_memory_utilization 0.6 \
+  --experiment_dir es-ft-svb-1
+
+SVB (150 generations, parallel to the O-LoRA 150-gen run)
+
+  python3 es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 150 \
+  --population_size 30 \
+  --num_engines 1 \
+  --cuda_devices 0 \
+  --svb_rank 16 \
+  --svb_truncate_every 1 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 32 \
+  --eval_anchor_every 5 \
+  --global_seed 0 \
+  --gpu_memory_utilization 0.7 \
+  --experiment_dir logs/es-ft-svb-150
+
+SVB + KL anchor (150 generations, composes the structural fix with the reward-side anchor)
+
+  python3 es_fine-tuning_countdown_accl.py \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --num_iterations 150 \
+  --population_size 30 \
+  --num_engines 1 \
+  --cuda_devices 0 \
+  --svb_rank 16 \
+  --svb_truncate_every 1 \
+  --kl_beta 1.0 \
+  --num_anchor_prompts 32 \
+  --anchor_pool_size 512 \
+  --eval_anchor_seed 9999 \
+  --num_eval_anchor_prompts 64 \
+  --eval_anchor_every 10 \
+  --global_seed 0 \
+  --gpu_memory_utilization 0.6 \
+  --experiment_dir es-ft-svb-kl-150

@@ -168,6 +168,42 @@ def parse_args():
             "(written after all iterations finish) is never pruned."
         ),
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a saved checkpoint to resume from. May be a "
+            "pytorch_model.pth file directly, or a checkpoint_iter_{N} "
+            "directory containing one. Loaded into all engines after init "
+            "(and after init_lora/init_svb if those are active) and before "
+            "anchor cache construction. Weights-only continuation: ES "
+            "population RNG and anchor batch rotation start fresh."
+        ),
+    )
+    parser.add_argument(
+        "--resume_iteration",
+        type=int,
+        default=0,
+        help=(
+            "Iteration index to start the loop at when resuming. Used as the "
+            "lower bound of the training loop and as the TensorBoard step "
+            "prefix so curves continue on the same x-axis. Should match the "
+            "iteration immediately after the loaded checkpoint (e.g. load "
+            "checkpoint_iter_80 -> --resume_iteration 81)."
+        ),
+    )
+    parser.add_argument(
+        "--resume_logging_dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, reuse this logging directory instead of creating a new "
+            "timestamped countdown_nccl_<ts> subdir under --experiment_dir. "
+            "Use this to append TensorBoard scalars and new checkpoints into "
+            "the original run's directory when resuming."
+        ),
+    )
     # O-LoRA-ES (orthogonal-subspace LoRA, hard projection)
     parser.add_argument(
         "--lora_rank",
@@ -567,7 +603,11 @@ def main(args):
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
     # Logging
-    logging_dir = f"{args.experiment_dir}/countdown_nccl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if args.resume_logging_dir:
+        logging_dir = args.resume_logging_dir
+        os.makedirs(logging_dir, exist_ok=True)
+    else:
+        logging_dir = f"{args.experiment_dir}/countdown_nccl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=logging_dir)
 
     # Prepare an HF checkpoint for vLLM to load
@@ -741,6 +781,30 @@ def main(args):
             )
         print(f"[svb] SVB active on {len(svb_target_names)} layers (engine 0)")
 
+    # Resume: load checkpoint into every engine before the anchor cache is
+    # built, so reference logprobs are computed against the resumed weights
+    # (initial KL eval should still report ~0). Must come after init_lora /
+    # init_svb so per-engine side state (_lora_A/_lora_B, _W_base_svb) exists.
+    if args.resume_from:
+        ckpt_path = args.resume_from
+        if os.path.isdir(ckpt_path):
+            ckpt_path = os.path.join(ckpt_path, "pytorch_model.pth")
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(
+                f"--resume_from: no pytorch_model.pth found at {ckpt_path}"
+            )
+        print(
+            f"[resume] Loading weights from {ckpt_path} into all "
+            f"{args.num_engines} engine(s); resuming at iteration "
+            f"{args.resume_iteration}"
+        )
+        ray.get([
+            engines[k].collective_rpc.remote(
+                "load_self_weights_from_disk", args=(ckpt_path,)
+            )
+            for k in range(args.num_engines)
+        ])
+
     # Build the KL behavioral-anchor pool while all engines are still at the
     # base-model weights. We do this on engine 0 only and reuse the cached
     # token IDs / pi_ref logprobs throughout training.
@@ -848,7 +912,7 @@ def main(args):
     # - Explore: per-seed add noise -> eval -> subtract noise (GPU-only)
     # - Compute ES update on engine 0 only
     # - Broadcast weights from engine 0 to all engines (NCCL)
-    for i in range(args.num_iterations):
+    for i in range(args.resume_iteration, args.num_iterations):
         print(f"\n\n=== Generation {i} ===")
         total_iter_start = time.time()
 

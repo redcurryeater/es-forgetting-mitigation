@@ -16,6 +16,9 @@ figures/
 bench_out/
 **/bench_out/
 
+# Presentation prep
+presentation_prep.md
+
 # Python
 __pycache__/
 *.pyc
