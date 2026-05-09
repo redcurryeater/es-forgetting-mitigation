@@ -64,6 +64,7 @@ lm_eval \
   --model_args "pretrained=${PRETRAINED},dtype=${DTYPE},gpu_memory_utilization=0.9,max_model_len=2048" \
   --tasks "$TASKS" \
   --batch_size "$BATCH_SIZE" \
-  --output_path "$OUT_DIR/results/$LABEL"
+  --log_samples \
+  --output_path "$OUT_DIR/results/$LABEL" 2>&1 | tee "$OUT_DIR/results/${LABEL}.log"
 
-echo "Done. Results under $OUT_DIR/results/$LABEL/"
+echo "Done. Results under $OUT_DIR/results/$LABEL/ (log: $OUT_DIR/results/${LABEL}.log)"
